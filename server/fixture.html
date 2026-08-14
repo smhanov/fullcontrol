@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>FullControl Fixture</title>
+    <style>
+      body { font: 16px/1.4 sans-serif; margin: 40px; background: #fafafa; }
+      #out { margin-top: 16px; padding: 12px; background: #eef; min-height: 2em; }
+      button, input, select { font: inherit; margin: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>FullControl Test Page</h1>
+    <p id="intro">Use this page to verify agent control.</p>
+    <button id="go">Click me</button>
+    <input id="name" placeholder="Your name" />
+    <select id="color">
+      <option value="red">Red</option>
+      <option value="blue">Blue</option>
+      <option value="green">Green</option>
+    </select>
+    <a id="more" href="#more">More</a>
+    <div id="out">idle</div>
+    <script>
+      document.getElementById("go").onclick = () => {
+        const name = document.getElementById("name").value || "nobody";
+        const color = document.getElementById("color").value;
+        document.getElementById("out").textContent = `clicked:${name}:${color}`;
+      };
+      window.__fc = { ready: true };
+    </script>
+  </body>
+</html>

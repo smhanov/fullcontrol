@@ -1,0 +1,14 @@
+{
+  "name": "fullcontrol",
+  "version": "1.0.0",
+  "description": "Chrome extension + relay so agents can observe and control a browser over the network",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node test/e2e.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}

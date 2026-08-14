@@ -1,0 +1,64 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        font: 13px/1.4 ui-sans-serif, system-ui, sans-serif;
+        margin: 0;
+        width: 320px;
+        background: #111;
+        color: #eee;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 14px 8px;
+      }
+      .dot {
+        width: 10px; height: 10px; border-radius: 50%;
+        background: #666;
+      }
+      .dot.ok { background: #3dd68c; box-shadow: 0 0 8px #3dd68c88; }
+      h1 { font-size: 14px; margin: 0; font-weight: 650; }
+      section { padding: 4px 14px 12px; }
+      label { display: block; color: #999; font-size: 11px; margin: 8px 0 3px; }
+      input {
+        width: 100%; box-sizing: border-box;
+        background: #1c1c1c; border: 1px solid #333; color: #eee;
+        padding: 6px 8px; border-radius: 6px; font: inherit;
+      }
+      code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+      .row { display: flex; justify-content: space-between; gap: 8px; margin-top: 6px; }
+      button {
+        background: #2a2a2a; color: #eee; border: 1px solid #444;
+        border-radius: 6px; padding: 6px 10px; cursor: pointer; font: inherit;
+      }
+      button:hover { background: #333; }
+      .err { color: #ff8b8b; font-size: 12px; margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div id="dot" class="dot"></div>
+      <h1>FullControl Agent</h1>
+    </header>
+    <section>
+      <div id="status">Connecting…</div>
+      <label>Relay WebSocket</label>
+      <input id="relay" />
+      <label>HTTP API</label>
+      <div class="mono" id="http">—</div>
+      <label>Token</label>
+      <div class="mono" id="token">—</div>
+      <div class="row">
+        <button id="copy">Copy token</button>
+        <button id="save">Save relay</button>
+      </div>
+      <div class="err" id="err"></div>
+    </section>
+    <script src="popup.js"></script>
+  </body>
+</html>

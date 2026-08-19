@@ -32,6 +32,101 @@ const agentClients = new Set();
 const eventLog = [];
 const MAX_EVENTS = 200;
 
+// --- Concurrency: agent identity, tab leases, per-window write serialization ---
+// Multiple agents can drive the same browser. Rules:
+//   - Every request carries an agent id (X-Agent-Id header or ?agentId=);
+//     default "default".
+//   - A tab can be LEASED by one agent. Write actions (click/type/press/
+//     select/navigate/reload/back/forward/scroll/hover/activate) are rejected
+//     with 409 when another agent holds the lease. Read actions (snapshot,
+//     screenshot, evaluate, console, wait) stay open to everyone.
+//   - Writes to tabs in the SAME WINDOW serialize through a per-window mutex,
+//     so two agents cannot fight over the visible tab / click ordering.
+//   - Agents can mint their own window (POST /windows) and scope everything
+//     to it via ?windowId= — the full isolation story.
+const AGENT_HEADER = "x-agent-id";
+const LEASE_TTL_MS = 5 * 60 * 1000; // default lease length
+const leases = new Map(); // tabId -> { agentId, expiresAt }
+const windowQueues = new Map(); // windowId -> Promise (write queue tail)
+const tabWindowCache = new Map(); // tabId -> windowId (for mutex routing)
+
+const WRITE_ACTIONS = new Set([
+  "click", "type", "press", "select", "navigate", "reload", "back",
+  "forward", "scroll", "hover", "activate",
+]);
+const MUTEX_ACTIONS = new Set([
+  "click", "type", "press", "select", "navigate", "reload", "back",
+  "forward", "scroll", "hover", "activate", "screenshot",
+]);
+
+function agentIdOf(req, url) {
+  const h = req.headers[AGENT_HEADER];
+  if (h) return String(h).slice(0, 64);
+  return (url.searchParams.get("agentId") || "default").slice(0, 64);
+}
+
+function agentIdOfWs(ws) {
+  return ws.agentId || "default";
+}
+
+function leaseFor(tabId) {
+  const l = leases.get(tabId);
+  if (!l) return null;
+  if (l.expiresAt < Date.now()) {
+    leases.delete(tabId);
+    return null;
+  }
+  return l;
+}
+
+function checkLease(tabId, agentId) {
+  const l = leaseFor(tabId);
+  if (l && l.agentId !== agentId) {
+    const err = new Error(
+      `tab ${tabId} is leased by agent "${l.agentId}" (expires ${new Date(l.expiresAt).toISOString()})`
+    );
+    err.status = 409;
+    throw err;
+  }
+  return l;
+}
+
+async function tabWindowId(tabId) {
+  if (tabWindowCache.has(tabId)) return tabWindowCache.get(tabId);
+  try {
+    const tabs = await sendToExtension("listTabs", { query: {} });
+    for (const t of tabs) tabWindowCache.set(t.id, t.windowId);
+    return tabWindowCache.get(tabId) || null;
+  } catch {
+    return null;
+  }
+}
+
+function withWindowMutex(windowId, fn) {
+  if (!windowId) return fn();
+  const prev = windowQueues.get(windowId) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  windowQueues.set(windowId, next.catch(() => {})); // errors don't block the queue
+  return next;
+}
+
+// Run a write action under lease check + per-window mutex.
+async function guardedWrite(method, params, agentId, timeoutMs) {
+  const tabId = Number(params.tabId);
+  const lease = checkLease(tabId, agentId);
+  if (lease) lease.expiresAt = Date.now() + LEASE_TTL_MS; // write renews the lease
+  const winId = await tabWindowId(tabId);
+  return withWindowMutex(winId, () => sendToExtension(method, params, timeoutMs));
+}
+
+function eventMatchesWindow(evt, windowId) {
+  if (!windowId) return true;
+  if (evt.windowId === windowId) return true;
+  if (evt.tab && evt.tab.windowId === windowId) return true;
+  if (evt.tabId != null && tabWindowCache.get(evt.tabId) === windowId) return true;
+  return false;
+}
+
 function log(...args) {
   const ts = new Date().toISOString();
   console.log(ts, ...args);
@@ -40,9 +135,21 @@ function log(...args) {
 function pushEvent(evt) {
   eventLog.push({ t: Date.now(), ...evt });
   if (eventLog.length > MAX_EVENTS) eventLog.shift();
+  // Clean up relay-side state when tabs die.
+  if (evt.event === "tabRemoved" && evt.tabId != null) {
+    leases.delete(evt.tabId);
+    tabWindowCache.delete(evt.tabId);
+  }
+  if (evt.tab && evt.tab.id != null && evt.tab.windowId != null) {
+    tabWindowCache.set(evt.tab.id, evt.tab.windowId);
+  }
   const payload = JSON.stringify({ type: "event", ...evt });
   for (const ws of agentClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+    if (ws.readyState === WebSocket.OPEN) {
+      // Agents subscribed to a window only receive that window's events.
+      if (ws.windowFilter && !eventMatchesWindow(evt, ws.windowFilter)) continue;
+      ws.send(payload);
+    }
   }
 }
 
@@ -207,6 +314,10 @@ async function route(req, res, url) {
   try {
     await handleApi(req, res, url);
   } catch (err) {
+    if (err.status === 409) {
+      json(res, 409, { error: err.message });
+      return;
+    }
     const status = /not connected/i.test(err.message) ? 503 : 400;
     json(res, status, { error: err.message || String(err) });
   }
@@ -247,17 +358,47 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (p === "/windows" && method === "POST") {
+    // Mint a window for an agent. Default focused:false — do NOT steal the
+    // user's focus (see extension v1.0.1 note). Agents scope tabs to it via
+    // ?windowId= for full isolation.
+    const body = await readBody(req);
+    const win = await sendToExtension("createWindow", {
+      url: body.url,
+      focused: body.focused === true,
+      state: body.state,
+    });
+    if (win && win.id) tabWindowCache.set(win.id, win.id);
+    json(res, 200, { window: win });
+    return;
+  }
+
+  if (p === "/leases" && method === "GET") {
+    const now = Date.now();
+    const active = [];
+    for (const [tabId, l] of leases) {
+      if (l.expiresAt > now) active.push({ tabId, agentId: l.agentId, expiresAt: l.expiresAt });
+      else leases.delete(tabId);
+    }
+    json(res, 200, { leases: active });
+    return;
+  }
+
   if (p === "/tabs" && method === "GET") {
     const query = {};
     if (url.searchParams.get("windowId")) query.windowId = Number(url.searchParams.get("windowId"));
     if (url.searchParams.get("active")) query.active = url.searchParams.get("active") === "true";
-    json(res, 200, { tabs: await sendToExtension("listTabs", { query }) });
+    const tabs = await sendToExtension("listTabs", { query });
+    for (const t of tabs) if (t.id != null) tabWindowCache.set(t.id, t.windowId);
+    json(res, 200, { tabs });
     return;
   }
 
   if (p === "/tabs" && method === "POST") {
     const body = await readBody(req);
-    json(res, 200, { tab: await sendToExtension("createTab", body) });
+    const tab = await sendToExtension("createTab", body);
+    if (tab && tab.id != null) tabWindowCache.set(tab.id, tab.windowId);
+    json(res, 200, { tab });
     return;
   }
 
@@ -265,6 +406,40 @@ async function handleApi(req, res, url) {
   if (tabMatch) {
     const tabId = Number(tabMatch[1]);
     const action = tabMatch[2] || "";
+    const agentId = agentIdOf(req, url);
+
+    // Lease management endpoints (relay-side, no extension call).
+    if (action === "lease" && method === "POST") {
+      const body = await readBody(req);
+      const ttlMs = Math.max(1000, Number(body.ttlMs) || LEASE_TTL_MS);
+      const existing = leaseFor(tabId);
+      if (existing && existing.agentId !== agentId) {
+        json(res, 409, {
+          error: `tab ${tabId} leased by agent "${existing.agentId}"`,
+          lease: { agentId: existing.agentId, expiresAt: existing.expiresAt },
+        });
+        return;
+      }
+      const expiresAt = Date.now() + ttlMs;
+      leases.set(tabId, { agentId, expiresAt });
+      json(res, 200, { ok: true, tabId, agentId, expiresAt });
+      return;
+    }
+    if (action === "release" && method === "POST") {
+      const existing = leaseFor(tabId);
+      if (!existing) {
+        json(res, 200, { ok: true, released: false });
+        return;
+      }
+      if (existing.agentId !== agentId && !(await readBody(req)).force) {
+        json(res, 409, { error: `tab ${tabId} leased by agent "${existing.agentId}"` });
+        return;
+      }
+      leases.delete(tabId);
+      json(res, 200, { ok: true, released: true });
+      return;
+    }
+
     if (!action && method === "GET") {
       const tabs = await sendToExtension("listTabs", { query: {} });
       const tab = tabs.find((t) => t.id === tabId);
@@ -273,35 +448,56 @@ async function handleApi(req, res, url) {
       return;
     }
     if (!action && method === "DELETE") {
+      leases.delete(tabId);
+      tabWindowCache.delete(tabId);
       json(res, 200, await sendToExtension("closeTab", { tabId }));
       return;
     }
     if (!action && (method === "PATCH" || method === "PUT")) {
       const body = await readBody(req);
-      json(res, 200, { tab: await sendToExtension("updateTab", { tabId, update: body }) });
+      const tab = await sendToExtension("updateTab", { tabId, update: body });
+      if (tab && tab.id != null) tabWindowCache.set(tab.id, tab.windowId);
+      json(res, 200, { tab });
       return;
     }
     if (method !== "POST" && method !== "GET") throw new Error("method not allowed");
     const body = method === "GET" ? Object.fromEntries(url.searchParams) : await readBody(req);
     const params = { tabId, ...body };
+
+    // Lease enforcement: write actions 409 when another agent holds the tab.
+    if (WRITE_ACTIONS.has(action)) {
+      try {
+        checkLease(tabId, agentId);
+      } catch (err) {
+        json(res, 409, { error: err.message });
+        return;
+      }
+    }
+
+    // Writes (and screenshots, which activate the tab) serialize per window.
+    const runAction = async (methodName, extra) => {
+      const result = await guardedWrite(methodName, params, agentId);
+      return extra ? extra(result) : result;
+    };
+
     switch (action) {
       case "activate":
-        json(res, 200, { tab: await sendToExtension("activateTab", params) });
+        json(res, 200, { tab: await runAction("activateTab") });
         return;
       case "reload":
-        json(res, 200, await sendToExtension("reloadTab", params));
+        json(res, 200, await runAction("reloadTab"));
         return;
       case "navigate":
-        json(res, 200, { tab: await sendToExtension("navigate", params) });
+        json(res, 200, { tab: await runAction("navigate") });
         return;
       case "back":
-        json(res, 200, await sendToExtension("goBack", params));
+        json(res, 200, await runAction("goBack"));
         return;
       case "forward":
-        json(res, 200, await sendToExtension("goForward", params));
+        json(res, 200, await runAction("goForward"));
         return;
       case "screenshot": {
-        const shot = await sendToExtension("screenshot", params, 20000);
+        const shot = await guardedWrite("screenshot", params, agentId, 20000);
         if (url.searchParams.get("raw") === "1" || body.raw) {
           const buf = Buffer.from(shot.data, "base64");
           res.writeHead(200, {
@@ -319,22 +515,22 @@ async function handleApi(req, res, url) {
         json(res, 200, await sendToExtension("snapshot", params, 20000));
         return;
       case "click":
-        json(res, 200, await sendToExtension("click", params));
+        json(res, 200, await runAction("click"));
         return;
       case "type":
-        json(res, 200, await sendToExtension("type", params));
+        json(res, 200, await runAction("type"));
         return;
       case "press":
-        json(res, 200, await sendToExtension("press", params));
+        json(res, 200, await runAction("press"));
         return;
       case "hover":
-        json(res, 200, await sendToExtension("hover", params));
+        json(res, 200, await runAction("hover"));
         return;
       case "scroll":
-        json(res, 200, await sendToExtension("scroll", params));
+        json(res, 200, await runAction("scroll"));
         return;
       case "select":
-        json(res, 200, await sendToExtension("select", params));
+        json(res, 200, await runAction("select"));
         return;
       case "wait":
         json(res, 200, await sendToExtension("waitFor", params, params.timeout || 20000));
@@ -414,10 +610,17 @@ function openApi() {
       "/health": { get: { summary: "Health, no auth" } },
       "/status": { get: { summary: "Relay + extension status" } },
       "/tabs": {
-        get: { summary: "List tabs" },
-        post: { summary: "Create tab {url, active, waitUntil}" },
+        get: { summary: "List tabs (?windowId=N scopes to a window)" },
+        post: { summary: "Create tab {url, active, waitUntil, windowId}" },
       },
-      "/tabs/{id}": { delete: { summary: "Close tab" } },
+      "/tabs/{id}": { delete: { summary: "Close tab (releases lease)" } },
+      "/tabs/{id}/lease": { post: { summary: "Claim tab {ttlMs}; 409 if leased by another agent" } },
+      "/tabs/{id}/release": { post: { summary: "Release lease {force?}" } },
+      "/leases": { get: { summary: "List active leases" } },
+      "/windows": {
+        get: { summary: "List windows" },
+        post: { summary: "Mint a window {url, focused?} for per-agent isolation" },
+      },
       "/tabs/{id}/navigate": { post: { summary: "{url}" } },
       "/tabs/{id}/screenshot": { get: { summary: "PNG/JPEG screenshot" }, post: {} },
       "/tabs/{id}/snapshot": { get: { summary: "Accessibility-ish page snapshot" }, post: {} },
@@ -469,12 +672,18 @@ server.on("upgrade", (req, socket, head) => {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
+      // Concurrency: agents may identify themselves and subscribe to one
+      // window's events (so agent B doesn't get spammed by agent A's churn).
+      ws.agentId = (url.searchParams.get("agentId") || "default").slice(0, 64);
+      ws.windowFilter = url.searchParams.get("window") ? Number(url.searchParams.get("window")) : null;
       agentClients.add(ws);
-      log("agent connected", agentClients.size);
+      log("agent connected", agentIdOfWs(ws), agentClients.size);
       ws.send(
         JSON.stringify({
           type: "welcome",
           extensionConnected: !!(extensionSocket && extensionSocket.readyState === WebSocket.OPEN),
+          agentId: ws.agentId,
+          windowFilter: ws.windowFilter,
         })
       );
       ws.on("message", async (data) => {
@@ -492,6 +701,10 @@ server.on("upgrade", (req, socket, head) => {
         const method = msg.method || msg.type;
         const id = msg.id;
         try {
+          // Lease enforcement on WS writes too.
+          if (WRITE_ACTIONS.has(method) && msg.params?.tabId != null) {
+            checkLease(Number(msg.params.tabId), ws.agentId);
+          }
           const result = await sendToExtension(method, msg.params || {}, msg.timeout || 30000);
           ws.send(JSON.stringify({ type: "response", id, result }));
         } catch (err) {

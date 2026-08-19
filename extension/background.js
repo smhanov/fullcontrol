@@ -144,6 +144,17 @@ async function dispatch(method, params) {
       return listTabs(params);
     case "listWindows":
       return chrome.windows.getAll({ populate: true });
+    case "createWindow":
+      // Mint a window. focused defaults to false so agents never steal the
+      // user's focus; pass focused:true only for human-in-the-loop moments.
+      return chrome.windows.create({
+        url: params.url || "about:blank",
+        focused: params.focused === true,
+        state: params.state,
+      });
+    case "closeWindow":
+      await chrome.windows.remove(num(params.windowId));
+      return { ok: true };
     case "createTab":
       return createTab(params);
     case "closeTab":

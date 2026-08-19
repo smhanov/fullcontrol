@@ -169,6 +169,29 @@ curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/wait" \
   -d '{"text":"Signed in","timeout":15000}'
 ```
 
+### Multi-agent concurrency (v1.0.2+)
+
+Multiple agents can share one browser. Identify yourself on every request
+with `X-Agent-Id: <name>` (default `"default"`):
+
+- **Tab leases**: `POST /tabs/:id/lease {"ttlMs":300000}` claims a tab.
+  Other agents' write actions (`click type press select navigate reload back
+  forward scroll hover activate`) get `409` on it; reads stay open. Writes by
+  the holder renew the lease. Release with `POST /tabs/:id/release`
+  (`{"force":true}` to take over a stuck lease). `GET /leases` lists them.
+- **Per-window mutex**: writes to tabs in the same window serialize — agents
+  sharing a window wait their turn instead of racing the visible tab.
+- **Per-agent windows**: `POST /windows {"url":...}` mints a window
+  (`focused:false` default — never steals the user's focus); scope tabs with
+  `POST /tabs {"windowId":W}` and list with `GET /tabs?windowId=W`. Full
+  isolation for parallel agents.
+- **Filtered events**: `ws://HOST:18765/agent?token=...&agentId=X&window=W`
+  only streams events for that window.
+
+Safe pattern: lease the tab in a `finally`-released block; on a 409 pick
+another tab/window instead of fighting. See the Hermes `fullcontrol-browser`
+skill for the full workflow.
+
 ### Escape hatches
 
 ```bash

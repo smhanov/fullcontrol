@@ -6,3 +6,8 @@ chrome-profile/
 test-profile/
 .tools/
 test-screenshot.png
+
+venv/
+vnc/
+__pycache__/
+scripts/__pycache__/

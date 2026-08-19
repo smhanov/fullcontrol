@@ -256,7 +256,14 @@ async function createTab(params) {
 async function activateTab(params) {
   const tabId = num(params.tabId);
   const tab = await chrome.tabs.get(tabId);
-  await chrome.windows.update(tab.windowId, { focused: true });
+  // Do NOT raise the window by default — that steals focus from whatever the
+  // user is doing (seen Aug 2026: Edge pops to front on e14 on every agent
+  // activate/screenshot). Activating the tab inside its window is enough for
+  // CDP/snapshot work. Pass {focus:true} to explicitly raise (human-in-the-
+  // loop moments: captcha solving, user observation).
+  if (params.focus) {
+    await chrome.windows.update(tab.windowId, { focused: true });
+  }
   return tabInfo(await chrome.tabs.update(tabId, { active: true }));
 }
 
@@ -298,21 +305,40 @@ async function screenshot(params) {
   let windowId;
   if (tabId != null) {
     const tab = await chrome.tabs.get(tabId);
-    await chrome.windows.update(tab.windowId, { focused: true });
+    // Make the tab active in its window WITHOUT raising the window — raising
+    // steals focus from the user on every agent screenshot (seen Aug 2026 on
+    // e14). captureVisibleTab only needs the tab active, not the window
+    // focused, in modern Chromium. If the capture still fails, fall back to
+    // focusing the window (below) so screenshots never break.
     if (!tab.active) await chrome.tabs.update(tabId, { active: true });
     await sleep(80);
     windowId = tab.windowId;
   }
   const format = params.format === "jpeg" ? "jpeg" : "png";
-  const dataUrl = await chrome.tabs.captureVisibleTab(windowId, {
-    format,
-    quality: params.quality || 90,
-  });
-  return {
-    mimeType: format === "jpeg" ? "image/jpeg" : "image/png",
-    data: dataUrl.replace(/^data:image\/\w+;base64,/, ""),
-    dataUrl,
-  };
+  const opts = { format, quality: params.quality || 90 };
+  try {
+    const dataUrl = await chrome.tabs.captureVisibleTab(windowId, opts);
+    return {
+      mimeType: format === "jpeg" ? "image/jpeg" : "image/png",
+      data: dataUrl.replace(/^data:image\/\w+;base64,/, ""),
+      dataUrl,
+    };
+  } catch (err) {
+    // Some pages/versions need the window raised. Only do it as a fallback
+    // so the common case never steals focus.
+    if (tabId != null) {
+      const tab = await chrome.tabs.get(tabId);
+      await chrome.windows.update(tab.windowId, { focused: true });
+      await sleep(120);
+      const dataUrl = await chrome.tabs.captureVisibleTab(windowId, opts);
+      return {
+        mimeType: format === "jpeg" ? "image/jpeg" : "image/png",
+        data: dataUrl.replace(/^data:image\/\w+;base64,/, ""),
+        dataUrl,
+      };
+    }
+    throw err;
+  }
 }
 
 async function snapshot(params) {

@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Trusted-Click Fixture</title>
+    <style>
+      body { font: 16px/1.4 sans-serif; margin: 40px; background: #fafafa; }
+      button, input, select { font: inherit; margin: 4px; padding: 6px 10px; }
+      #log { margin-top: 16px; padding: 12px; background: #efe; min-height: 3em; white-space: pre-wrap; font-family: monospace; }
+    </style>
+  </head>
+  <body>
+    <h1>FullControl Trusted-Click Fixture</h1>
+    <p>Simulates modern frameworks that reject untrusted (synthetic) events:</p>
+    <ul>
+      <li>capture-phase <code>pointerdown</code>/<code>mousedown</code> listeners <code>preventDefault()</code> when <code>!e.isTrusted</code> (Angular CDK overlay behavior)</li>
+      <li>a React-style root-delegated <code>click</code> listener that only records trusted events</li>
+      <li>buttons that only act when the full trusted sequence (pointerdown → mousedown → click) lands</li>
+    </ul>
+    <button id="btn">Trusted-only button</button>
+    <button id="btn2">Another button</button>
+    <input id="name" placeholder="name" />
+    <div id="log">idle</div>
+    <script>
+      const log = document.getElementById("log");
+      const record = (s) => { log.textContent += (log.textContent === "idle" ? "" : "\n") + s; };
+
+      // 1) Angular-CDK-style: cancel any untrusted pointer/mouse down.
+      for (const type of ["pointerdown", "mousedown"]) {
+        document.addEventListener(type, (e) => {
+          if (!e.isTrusted) {
+            record(`REJECTED untrusted ${type}`);
+            e.preventDefault();
+          }
+        }, true);
+      }
+
+      // 2) React-style root delegation: only trusted clicks count.
+      document.addEventListener("click", (e) => {
+        if (e.isTrusted) record(`trusted click on #${e.target.id || e.target.tagName}`);
+      });
+
+      // 3) Buttons that track full native activation.
+      for (const id of ["btn", "btn2"]) {
+        const b = document.getElementById(id);
+        b.addEventListener("pointerdown", () => { b.dataset.pd = "1"; });
+        b.addEventListener("mousedown", () => { b.dataset.md = "1"; });
+        b.addEventListener("click", (e) => {
+          if (!e.isTrusted) { record(`#${id} ignored synthetic click`); return; }
+          record(`#${id} ACTIVATED pd=${b.dataset.pd} md=${b.dataset.md}`);
+        });
+      }
+
+      document.getElementById("name").addEventListener("click", (e) => {
+        if (e.isTrusted) record("input focused by trusted click");
+      });
+
+      window.__fcTrusted = { ready: true };
+    </script>
+  </body>
+</html>

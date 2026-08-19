@@ -214,6 +214,14 @@
         if (msg.clear && "value" in el) setNativeValue(el, "");
         return { ok: true, ref: refFor(el) };
       }
+      case "point": {
+        // Resolve a ref/selector to its live viewport center WITHOUT
+        // dispatching any events. Used by background.js to drive a trusted
+        // CDP click at the element's real position.
+        const el = resolve(msg.selector, msg.ref);
+        const c = center(el);
+        return { ok: true, ref: refFor(el), x: Math.round(c.x), y: Math.round(c.y), bbox: c.bbox };
+      }
       case "type": {
         const el = document.activeElement;
         if (!el) throw new Error("nothing focused");

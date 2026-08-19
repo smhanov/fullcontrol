@@ -328,31 +328,83 @@ async function snapshot(params) {
 
 async function click(params) {
   const tabId = num(params.tabId);
+  const button = params.button || "left";
+  const clickCount = params.clickCount || 1;
   if (params.x != null && params.y != null) {
     await attach(tabId);
-    await sendCdp(tabId, "Input.dispatchMouseEvent", {
-      type: "mousePressed",
-      x: params.x,
-      y: params.y,
-      button: params.button || "left",
-      clickCount: params.clickCount || 1,
-    });
-    await sendCdp(tabId, "Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      x: params.x,
-      y: params.y,
-      button: params.button || "left",
-      clickCount: params.clickCount || 1,
-    });
+    await trustedClick(tabId, params.x, params.y, button, clickCount);
     return { ok: true, via: "cdp", x: params.x, y: params.y };
+  }
+  // Ref/selector clicks: resolve the element's live center, then click it
+  // with TRUSTED CDP input (isTrusted=true). Synthetic dispatchEvent clicks
+  // are ignored by React, Angular CDK overlays, select2, and any page that
+  // checks event.isTrusted — the #1 cause of "click didn't register".
+  // Fall back to synthetic events if CDP attach fails (some pages deny the
+  // debugger: "Cannot access a chrome-extension:// URL...").
+  if (params.selector || params.ref) {
+    try {
+      const pt = await withContent(tabId, {
+        type: "point",
+        selector: params.selector,
+        ref: params.ref,
+      });
+      if (pt && Number.isFinite(pt.x) && Number.isFinite(pt.y)) {
+        await attach(tabId);
+        await trustedClick(tabId, pt.x, pt.y, button, clickCount);
+        return { ok: true, via: "cdp", x: pt.x, y: pt.y, ref: pt.ref, bbox: pt.bbox };
+      }
+    } catch (err) {
+      // attach or point resolution failed — fall through to synthetic
+    }
   }
   return withContent(tabId, {
     type: "click",
     selector: params.selector,
     ref: params.ref,
-    button: params.button || "left",
-    clickCount: params.clickCount || 1,
+    button,
+    clickCount,
   });
+}
+
+// Trusted mouse click via the CDP Input domain. Chrome treats these as real
+// user input (isTrusted=true), hit-tested at (x, y), generating the proper
+// pointerdown/mousedown/pointerup/mouseup/click sequence. A mouseMoved
+// precedes the press so hover/pointerenter handlers fire and hit-testing is
+// correct, and clickCount>1 emits the press/release pairs for a real
+// double-click.
+async function trustedClick(tabId, x, y, button, clickCount) {
+  const count = Math.max(1, clickCount || 1);
+  const btn =
+    button === 2 || button === "right" ? "right" :
+    button === 1 || button === "middle" ? "middle" :
+    button === 3 || button === "back" ? "back" :
+    button === 4 || button === "forward" ? "forward" : "left";
+  const buttons = btn === "right" ? 2 : btn === "middle" ? 4 : btn === "back" ? 8 : btn === "forward" ? 16 : 1;
+  await sendCdp(tabId, "Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x,
+    y,
+    button: "none",
+    buttons: 0,
+  });
+  for (let i = 1; i <= count; i++) {
+    await sendCdp(tabId, "Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x,
+      y,
+      button: btn,
+      buttons,
+      clickCount: i,
+    });
+    await sendCdp(tabId, "Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x,
+      y,
+      button: btn,
+      buttons: 0,
+      clickCount: i,
+    });
+  }
 }
 
 async function hover(params) {

@@ -132,9 +132,19 @@ Screenshot captures the **visible** tab. Activate the tab first if it is in the 
 
 ```bash
 # Click by CSS, snapshot ref, or coordinates
+# NOTE (since 074c751): ref/selector clicks dispatch TRUSTED CDP input
+# (isTrusted=true) — they register on React/Angular-CDK/select2 pages that
+# ignore synthetic dispatchEvent clicks. Falls back to synthetic only when
+# the debugger is denied. Response includes via:"cdp" + x,y,bbox.
 curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/click" -d '{"selector":"#go"}'
 curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/click" -d '{"ref":"e12"}'
 curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/click" -d '{"x":100,"y":200}'
+
+# Refs are bbox-anchored and go stale on ANY DOM re-render. Re-snapshot
+# before every interaction after a mutation; never retry with the same ref.
+# /select is the ONLY reliable dropdown path on select2/AngularJS pages
+# (raw value-set + change reverts; synthetic clicks ignored).
+curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/select" -d '{"ref":"e9","value":"12"}'
 
 curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/hover" -d '{"ref":"e12"}'
 

@@ -251,13 +251,21 @@ function tabInfo(tab) {
 }
 
 async function createTab(params) {
+  const wantActive = params.active !== false;
+  // Create inactive first: chrome.tabs.create({active:true}) raises the whole
+  // window to the foreground (seen Aug 2026 on Linux), stealing the user's
+  // focus. Activating via tabs.update afterwards makes the tab active inside
+  // its window WITHOUT raising it.
   const tab = await chrome.tabs.create({
     url: params.url || "about:blank",
-    active: params.active !== false,
+    active: false,
     windowId: params.windowId,
     index: params.index,
     pinned: !!params.pinned,
   });
+  if (wantActive) {
+    await chrome.tabs.update(tab.id, { active: true });
+  }
   if (params.waitUntil) {
     await waitTabComplete(tab.id, params.timeout || 30000);
   }

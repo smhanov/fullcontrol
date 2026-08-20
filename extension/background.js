@@ -10,7 +10,11 @@ let httpPort = 18765;
 
 chrome.runtime.onInstalled.addListener(() => ensureOffscreen());
 chrome.runtime.onStartup.addListener(() => ensureOffscreen());
-chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
+// 0.5 min = Chrome's documented minimum for chrome.alarms (0.4 gets
+// clamped). This races the 30s MV3 SW idle timeout on purpose: each alarm
+// event resets the SW idle timer AND re-verifies the offscreen doc (the
+// WebSocket holder), so a dead offscreen is recreated within ~30-60s.
+chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === "keepalive") ensureOffscreen();
 });
@@ -46,6 +50,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.type === "message") {
     handleRelayRaw(msg.data).catch((err) => console.warn("relay handler", err));
+    // Every relay event also nudges the offscreen doc (SW -> offscreen
+    // runtime messages keep it from Chrome's idle-close; the relay pongs the
+    // extension's 15s WS heartbeat, so this fires at least every ~15s).
+    keepOffscreenAlive();
     sendResponse?.({ ok: true });
     return true;
   }
@@ -56,14 +64,53 @@ async function ensureOffscreen() {
   const contexts = await chrome.runtime.getContexts({
     contextTypes: ["OFFSCREEN_DOCUMENT"],
   });
-  if (!contexts.length) {
-    await chrome.offscreen.createDocument({
-      url: "offscreen.html",
-      reasons: ["BLOBS"],
-      justification: "Keep a persistent WebSocket to the FullControl relay",
-    });
+  if (contexts.length) {
+    // A dying/zombie context still shows up in getContexts but drops
+    // messages — verify it actually answers, and if not, tear it down and
+    // recreate. Chrome allows only ONE offscreen doc per extension, so
+    // closeDocument() must precede createDocument().
+    if (await pingOffscreen()) return pushConfig();
+    try {
+      await chrome.offscreen.closeDocument();
+    } catch {}
   }
+  await chrome.offscreen.createDocument({
+    url: "offscreen.html",
+    reasons: ["BLOBS"],
+    justification: "Keep a persistent WebSocket to the FullControl relay",
+  });
   await pushConfig();
+}
+
+// Resolves true only if the offscreen doc answers a ping within 3s.
+function pingOffscreen() {
+  return new Promise((resolve) => {
+    let settled = false;
+    function done(v) {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve(v);
+      }
+    }
+    const timer = setTimeout(() => done(false), 3000);
+    try {
+      chrome.runtime
+        .sendMessage({ channel: "fc-offscreen", type: "ping" })
+        .then((resp) => done(!!(resp && resp.ok === true)))
+        .catch(() => done(false));
+    } catch {
+      done(false);
+    }
+  });
+}
+
+// Cheap SW -> offscreen nudge; no response needed. Keeps the offscreen doc
+// (WS holder) warm so Chrome's idle-close never takes it down.
+function keepOffscreenAlive() {
+  chrome.runtime
+    .sendMessage({ channel: "fc-offscreen", type: "keepalive" })
+    .catch(() => {});
 }
 
 async function pushConfig() {

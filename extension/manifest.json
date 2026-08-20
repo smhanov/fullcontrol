@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FullControl Agent",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Lets an agent fully observe and control this browser over the network.",
   "permissions": [
     "tabs",

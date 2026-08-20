@@ -654,9 +654,11 @@ server.on("upgrade", (req, socket, head) => {
       extensionSocket = ws;
       log("extension connected");
       ws.on("message", (data) => handleExtensionMessage(data.toString()));
-      ws.on("close", () => {
+      ws.on("close", (code, reason) => {
         if (extensionSocket === ws) extensionSocket = null;
-        log("extension disconnected");
+        log(
+          `extension disconnected (code=${code}${reason ? `, reason="${reason}"` : ""})`
+        );
         pushEvent({ event: "extensionDisconnected" });
         for (const [, p] of pending) p.reject(new Error("extension disconnected"));
         pending.clear();

@@ -11,6 +11,16 @@ let connecting = false;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || msg.channel !== "fc-offscreen") return;
+  if (msg.type === "ping") {
+    // Liveness probe from the SW (ensureOffscreen) — answer so the SW knows
+    // this doc is alive and doesn't tear us down + recreate.
+    sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === "keepalive") {
+    // SW -> offscreen nudge; nothing to do, just keep the channel warm.
+    return false;
+  }
   if (msg.type === "config") {
     const nextUrl = msg.relayUrl || DEFAULT_RELAY;
     const nextToken = msg.token || "";

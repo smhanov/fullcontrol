@@ -41,6 +41,15 @@ chrome.storage.onChanged.addListener((changes) => {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || msg.channel !== "fc-relay") return;
+  if (msg.type === "humanActivity") {
+    // Content-script beacon: a human interacted with a page. Forward to the
+    // relay so its tab reaper can veto closing tabs a human is using.
+    if (sender.tab && sender.tab.id != null) {
+      sendToRelay({ type: "event", event: "humanActivity", tabId: sender.tab.id });
+    }
+    sendResponse?.({ ok: true });
+    return true;
+  }
   if (msg.type === "status") {
     connected = !!msg.connected;
     lastError = msg.lastError || "";
@@ -801,6 +810,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 chrome.tabs.onActivated.addListener((info) => {
   sendToRelay({ type: "event", event: "tabActivated", info });
+});
+// Window focus changes: the relay's tab reaper uses this to tell "a human is
+// looking at this window" from "agent tab sitting in the background". Note
+// WINDOW_ID_NONE (-1) means no window has focus.
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  sendToRelay({ type: "event", event: "windowFocusChanged", windowId });
 });
 
 ensureOffscreen();

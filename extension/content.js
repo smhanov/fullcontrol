@@ -293,3 +293,34 @@
     }
   }
 })();
+
+// --- Human-activity beacon (tab reaper support) ---
+// The relay's reaper must never close a tab a human took over. Any REAL
+// user input on the page (isTrusted events — clicks, keys, scroll, touch)
+// is forwarded to the relay, throttled to ~1 per 5s. CDP-driven agent
+// clicks are also isTrusted, but that is harmless: agent writes already
+// keep the tab alive via lastAgentAt, and the beacon's veto window (30 min)
+// is far shorter than the idle threshold (hours), so an agent click that
+// happened long ago never protects a genuinely abandoned tab.
+(function () {
+  const BEACON_MIN_MS = 5000;
+  let lastBeacon = 0;
+  function beacon() {
+    const now = Date.now();
+    if (now - lastBeacon < BEACON_MIN_MS) return;
+    lastBeacon = now;
+    try {
+      chrome.runtime
+        .sendMessage({ channel: "fc-relay", type: "humanActivity" })
+        .catch(() => {});
+    } catch {
+      /* extension context may be gone during navigation */
+    }
+  }
+  const EVENTS = ["mousedown", "keydown", "wheel", "touchstart"];
+  for (const type of EVENTS) {
+    window.addEventListener(type, (e) => {
+      if (e.isTrusted) beacon();
+    }, { passive: true });
+  }
+})();

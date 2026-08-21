@@ -50,6 +50,75 @@ const leases = new Map(); // tabId -> { agentId, expiresAt }
 const windowQueues = new Map(); // windowId -> Promise (write queue tail)
 const tabWindowCache = new Map(); // tabId -> windowId (for mutex routing)
 
+// --- Tab reaper: close agent-abandoned tabs, never human-taken-over ones ---
+// The relay stamps OWNERSHIP on every tab created via POST /tabs (owner =
+// X-Agent-Id). A periodic sweep closes tabs that are idle (no agent writes
+// for FC_REAPER_IDLE_MS) AND pass every human-takeover veto. Vetoes protect
+// a human who grabbed an agent tab and navigated it somewhere else:
+//   - URL divergence: live URL != last URL the agent set -> someone (human
+//     or a page redirect) moved it -> keep. Divergence is a VETO ONLY, never
+//     a trigger — page-initiated redirects (login flows) also change URLs
+//     and must not cause a close.
+//   - Recent human input on the tab (content-script beacon, isTrusted only)
+//   - Active tab in a recently focused window
+//   - Pinned / audible (playing media)
+//   - An active lease (another agent is working right now)
+// Tabs with NO ownership record are the human's own -> never touched.
+// Config (env): FC_REAPER_IDLE_MS (0=off, the default), FC_REAPER_HUMAN_MS,
+//   FC_REAPER_INTERVAL_MS (min 60s), FC_REAPER_DRY_RUN (default "1" = report
+//   only; set "0" to actually close).
+const REAPER_IDLE_MS = Number(process.env.FC_REAPER_IDLE_MS || 0);
+const REAPER_HUMAN_MS = Number(process.env.FC_REAPER_HUMAN_MS || 30 * 60 * 1000);
+const REAPER_INTERVAL_MS = Math.max(60_000, Number(process.env.FC_REAPER_INTERVAL_MS || 10 * 60 * 1000));
+const REAPER_DRY_RUN = String(process.env.FC_REAPER_DRY_RUN || "1") !== "0";
+// Ownership records survive relay restarts so a restart can't orphan agent
+// tabs into immortality (seen during the 1.0.5 deploy: restart wiped the map
+// and the reaper forgot every tab it owned).
+const TABMETA_FILE = process.env.FC_TABMETA_FILE || path.join(ROOT, ".tabmeta.json");
+const tabMeta = new Map(); // tabId -> { owner, createdAt, lastAgentAt, lastAgentUrl, humanAt }
+let tabMetaSaveTimer = null;
+function loadTabMeta() {
+  try {
+    const raw = fs.readFileSync(TABMETA_FILE, "utf8");
+    const obj = JSON.parse(raw);
+    for (const [id, m] of Object.entries(obj)) tabMeta.set(Number(id), m);
+    log(`loaded ${tabMeta.size} tab ownership records from ${TABMETA_FILE}`);
+  } catch (e) {
+    if (e.code !== "ENOENT") log("tabmeta load warning:", e.message);
+  }
+}
+function saveTabMeta() {
+  clearTimeout(tabMetaSaveTimer);
+  tabMetaSaveTimer = setTimeout(() => {
+    try {
+      const obj = Object.fromEntries(tabMeta);
+      fs.writeFileSync(TABMETA_FILE, JSON.stringify(obj, null, 2), { mode: 0o600 });
+    } catch (e) {
+      log("tabmeta save warning:", e.message);
+    }
+  }, 1000);
+}
+function touchTabMeta(tabId, patch = {}) {
+  const m = tabMeta.get(tabId);
+  if (!m) return;
+  Object.assign(m, patch);
+  saveTabMeta();
+}
+function deleteTabMeta(tabId) {
+  if (!tabMeta.delete(tabId)) return;
+  saveTabMeta();
+}
+let focusedWindowId = null;
+let lastFocusAt = 0;
+let reaperStats = {
+  enabled: REAPER_IDLE_MS > 0,
+  dryRun: REAPER_DRY_RUN,
+  idleMs: REAPER_IDLE_MS,
+  sweeps: 0,
+  lastSweepAt: 0,
+  lastRun: null, // { considered, wouldClose, closed, vetoed, vetoReasons }
+};
+
 const WRITE_ACTIONS = new Set([
   "click", "type", "press", "select", "navigate", "reload", "back",
   "forward", "scroll", "hover", "activate",
@@ -115,6 +184,7 @@ async function guardedWrite(method, params, agentId, timeoutMs) {
   const tabId = Number(params.tabId);
   const lease = checkLease(tabId, agentId);
   if (lease) lease.expiresAt = Date.now() + LEASE_TTL_MS; // write renews the lease
+  touchTabMeta(tabId, { lastAgentAt: Date.now() }); // any agent write marks the tab active
   const winId = await tabWindowId(tabId);
   return withWindowMutex(winId, () => sendToExtension(method, params, timeoutMs));
 }
@@ -125,6 +195,73 @@ function eventMatchesWindow(evt, windowId) {
   if (evt.tab && evt.tab.windowId === windowId) return true;
   if (evt.tabId != null && tabWindowCache.get(evt.tabId) === windowId) return true;
   return false;
+}
+
+// --- Tab reaper sweep ---
+// Close agent-owned tabs that have been idle long enough, unless a human
+// plausibly took them over. See the config block at the top for the veto
+// rationale. Returns a stats object; respects REAPER_DRY_RUN.
+async function reapIdleTabs() {
+  if (REAPER_IDLE_MS <= 0) return { enabled: false, dryRun: REAPER_DRY_RUN };
+  let tabs;
+  try {
+    tabs = await sendToExtension("listTabs", { query: {} });
+  } catch (err) {
+    log("reaper: listTabs failed", err.message);
+    return { error: err.message, enabled: true, dryRun: REAPER_DRY_RUN };
+  }
+  const now = Date.now();
+  const stats = { considered: 0, wouldClose: 0, closed: 0, vetoed: 0, vetoReasons: {} };
+  const bump = (k) => { stats.vetoReasons[k] = (stats.vetoReasons[k] || 0) + 1; };
+  // Prune ownership records for tabs that no longer exist (e.g. died while
+  // the relay was down — tabRemoved events can't fire for those).
+  const liveIds = new Set(tabs.map((t) => t.id));
+  for (const id of [...tabMeta.keys()]) {
+    if (!liveIds.has(id)) deleteTabMeta(id);
+  }
+  for (const t of tabs) {
+    const m = tabMeta.get(t.id);
+    if (!m) continue; // no ownership record -> the human's own tab, never touch
+    stats.considered++;
+    if (leaseFor(t.id)) { stats.vetoed++; bump("leased"); continue; }
+    const vetoes = [];
+    if (now - m.lastAgentAt < REAPER_IDLE_MS) vetoes.push("recentlyUsed");
+    if (t.pinned) vetoes.push("pinned");
+    if (t.audible) vetoes.push("audible");
+    if (t.active && focusedWindowId != null && t.windowId === focusedWindowId && now - lastFocusAt < REAPER_HUMAN_MS) {
+      vetoes.push("activeInFocusedWindow");
+    }
+    if (m.humanAt && now - m.humanAt < REAPER_HUMAN_MS) vetoes.push("humanActivity");
+    if (m.lastAgentUrl && t.url && t.url !== m.lastAgentUrl) vetoes.push("urlDiverged");
+    if (vetoes.length) {
+      stats.vetoed++;
+      for (const v of vetoes) bump(v);
+      continue;
+    }
+    stats.wouldClose++;
+    if (REAPER_DRY_RUN) continue;
+    try {
+      await sendToExtension("closeTab", { tabId: t.id });
+      leases.delete(t.id);
+      tabWindowCache.delete(t.id);
+      deleteTabMeta(t.id);
+      stats.closed++;
+      log("reaper: closed idle agent tab", t.id, t.url || "", "owner=" + m.owner,
+        "idleMs=" + (now - m.lastAgentAt));
+      pushEvent({ event: "tabReaped", tabId: t.id, owner: m.owner, url: t.url || "" });
+    } catch (err) {
+      log("reaper: close failed for tab", t.id, err.message);
+    }
+  }
+  reaperStats.sweeps++;
+  reaperStats.lastSweepAt = Date.now();
+  reaperStats.lastRun = stats;
+  if (stats.considered || stats.wouldClose) {
+    log("reaper: sweep", REAPER_DRY_RUN ? "DRY-RUN" : "live",
+      JSON.stringify({ considered: stats.considered, wouldClose: stats.wouldClose,
+        closed: stats.closed, vetoed: stats.vetoed, vetoReasons: stats.vetoReasons }));
+  }
+  return stats;
 }
 
 function log(...args) {
@@ -139,6 +276,17 @@ function pushEvent(evt) {
   if (evt.event === "tabRemoved" && evt.tabId != null) {
     leases.delete(evt.tabId);
     tabWindowCache.delete(evt.tabId);
+    deleteTabMeta(evt.tabId);
+  }
+  // Human-activity beacon from a content script (user input, isTrusted) —
+  // the reaper uses this as a "a human is on this tab" veto.
+  if (evt.event === "humanActivity" && evt.tabId != null) {
+    touchTabMeta(evt.tabId, { humanAt: Date.now() });
+  }
+  // Window focus is the "is a human looking at this window" signal.
+  if (evt.event === "windowFocusChanged") {
+    focusedWindowId = evt.windowId === -1 ? null : evt.windowId;
+    lastFocusAt = Date.now();
   }
   if (evt.tab && evt.tab.id != null && evt.tab.windowId != null) {
     tabWindowCache.set(evt.tab.id, evt.tab.windowId);
@@ -336,6 +484,11 @@ async function handleApi(req, res, url) {
       agents: agentClients.size,
       port: PORT,
       extension: ext,
+      reaper: reaperStats,
+      ownedTabs: [...tabMeta.entries()].map(([id, m]) => ({
+        tabId: id, owner: m.owner, createdAt: m.createdAt,
+        lastAgentAt: m.lastAgentAt, lastAgentUrl: m.lastAgentUrl, humanAt: m.humanAt,
+      })),
     });
     return;
   }
@@ -389,16 +542,43 @@ async function handleApi(req, res, url) {
     if (url.searchParams.get("windowId")) query.windowId = Number(url.searchParams.get("windowId"));
     if (url.searchParams.get("active")) query.active = url.searchParams.get("active") === "true";
     const tabs = await sendToExtension("listTabs", { query });
-    for (const t of tabs) if (t.id != null) tabWindowCache.set(t.id, t.windowId);
+    for (const t of tabs) {
+      if (t.id != null) tabWindowCache.set(t.id, t.windowId);
+      const m = tabMeta.get(t.id);
+      if (m) t.owner = m.owner; // annotate so agents/humans can see ownership
+    }
     json(res, 200, { tabs });
     return;
   }
 
   if (p === "/tabs" && method === "POST") {
     const body = await readBody(req);
+    const agentId = agentIdOf(req, url);
     const tab = await sendToExtension("createTab", body);
-    if (tab && tab.id != null) tabWindowCache.set(tab.id, tab.windowId);
+    if (tab && tab.id != null) {
+      tabWindowCache.set(tab.id, tab.windowId);
+      // Stamp ownership: the tab is now that agent's responsibility, and the
+      // reaper may reclaim it if it goes idle and stays untouched.
+      tabMeta.set(tab.id, {
+        owner: agentId,
+        createdAt: Date.now(),
+        lastAgentAt: Date.now(),
+        lastAgentUrl: body.url || tab.url || "about:blank",
+        humanAt: 0,
+      });
+      saveTabMeta();
+      tab.owner = agentId;
+    }
     json(res, 200, { tab });
+    return;
+  }
+
+  if (p === "/reaper" && method === "GET") {
+    json(res, 200, reaperStats);
+    return;
+  }
+  if (p === "/reaper" && method === "POST") {
+    json(res, 200, await reapIdleTabs());
     return;
   }
 
@@ -450,6 +630,7 @@ async function handleApi(req, res, url) {
     if (!action && method === "DELETE") {
       leases.delete(tabId);
       tabWindowCache.delete(tabId);
+      deleteTabMeta(tabId);
       json(res, 200, await sendToExtension("closeTab", { tabId }));
       return;
     }
@@ -487,9 +668,12 @@ async function handleApi(req, res, url) {
       case "reload":
         json(res, 200, await runAction("reloadTab"));
         return;
-      case "navigate":
-        json(res, 200, { tab: await runAction("navigate") });
+      case "navigate": {
+        const r = await runAction("navigate");
+        touchTabMeta(tabId, { lastAgentAt: Date.now(), lastAgentUrl: params.url });
+        json(res, 200, r);
         return;
+      }
       case "back":
         json(res, 200, await runAction("goBack"));
         return;
@@ -511,9 +695,11 @@ async function handleApi(req, res, url) {
         json(res, 200, shot);
         return;
       }
-      case "snapshot":
+      case "snapshot": {
+        touchTabMeta(tabId, { lastAgentAt: Date.now() }); // reads count as activity too
         json(res, 200, await sendToExtension("snapshot", params, 20000));
         return;
+      }
       case "click":
         json(res, 200, await runAction("click"));
         return;
@@ -532,12 +718,16 @@ async function handleApi(req, res, url) {
       case "select":
         json(res, 200, await runAction("select"));
         return;
-      case "wait":
+      case "wait": {
+        touchTabMeta(tabId, { lastAgentAt: Date.now() });
         json(res, 200, await sendToExtension("waitFor", params, params.timeout || 20000));
         return;
-      case "evaluate":
+      }
+      case "evaluate": {
+        touchTabMeta(tabId, { lastAgentAt: Date.now() });
         json(res, 200, await sendToExtension("evaluate", params));
         return;
+      }
       case "cdp":
         json(res, 200, await sendToExtension("cdp", params, params.timeout || 30000));
         return;
@@ -617,6 +807,10 @@ function openApi() {
       "/tabs/{id}/lease": { post: { summary: "Claim tab {ttlMs}; 409 if leased by another agent" } },
       "/tabs/{id}/release": { post: { summary: "Release lease {force?}" } },
       "/leases": { get: { summary: "List active leases" } },
+      "/reaper": {
+        get: { summary: "Tab reaper config + last sweep stats" },
+        post: { summary: "Trigger a reaper sweep now (dry-run unless FC_REAPER_DRY_RUN=0)" },
+      },
       "/windows": {
         get: { summary: "List windows" },
         post: { summary: "Mint a window {url, focused?} for per-agent isolation" },
@@ -728,6 +922,16 @@ server.listen(PORT, HOST, () => {
   log(`Token file: ${TOKEN_FILE}`);
   log(`Extension WS: ws://${HOST}:${PORT}/extension`);
   log(`Agent WS:     ws://${HOST}:${PORT}/agent?token=...`);
+  loadTabMeta();
+  if (REAPER_IDLE_MS > 0) {
+    log(`Tab reaper enabled: idleMs=${REAPER_IDLE_MS} humanMs=${REAPER_HUMAN_MS} ` +
+      `intervalMs=${REAPER_INTERVAL_MS} dryRun=${REAPER_DRY_RUN}`);
+    setInterval(reapIdleTabs, REAPER_INTERVAL_MS);
+    // One early sweep so a dry-run shows the lay of the land quickly.
+    setTimeout(reapIdleTabs, 15_000).unref();
+  } else {
+    log("Tab reaper disabled (FC_REAPER_IDLE_MS not set)");
+  }
 });
 
 process.on("SIGINT", () => {

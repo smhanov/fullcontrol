@@ -1,6 +1,6 @@
 ---
 name: fullcontrol-browser
-description: "Drive a remote Chrome browser that has the FullControl extension installed. Use when: the user gives a hostname/IP of a FullControl browser, asks you to open/click/type/screenshot/snapshot a real browser tab, control a browser on another machine, or use FullControl / the FullControl Agent relay. Also use for browser automation via HTTP on port 18765."
+description: "Drive a remote Chrome browser that has the FullControl extension installed. Use when: the user gives a hostname/IP of a FullControl browser, asks you to open/click/type/screenshot/snapshot a real browser tab, control a browser on another machine, or use FullControl / the FullControl Agent relay. Also use for browser automation via HTTP on port 18765. Covers trusted CDP clicks, tab leases/ownership, the tab reaper, and multi-agent windows."
 argument-hint: "<host> [task]"
 user-invocable: true
 disable-model-invocation: false
@@ -136,6 +136,9 @@ Screenshot captures the **visible** tab. Activate the tab first if it is in the 
 # (isTrusted=true) — they register on React/Angular-CDK/select2 pages that
 # ignore synthetic dispatchEvent clicks. Falls back to synthetic only when
 # the debugger is denied. Response includes via:"cdp" + x,y,bbox.
+# NOTE (since d59d7b7): click/press/type accept {"focus":true} to RAISE the
+# window — use ONLY for human-in-the-loop moments (captchas). Default does
+# not steal focus, so the user's screen is never yanked mid-task.
 curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/click" -d '{"selector":"#go"}'
 curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/click" -d '{"ref":"e12"}'
 curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/click" -d '{"x":100,"y":200}'
@@ -189,8 +192,37 @@ with `X-Agent-Id: <name>` (default `"default"`):
   only streams events for that window.
 
 Safe pattern: lease the tab in a `finally`-released block; on a 409 pick
-another tab/window instead of fighting. See the Hermes `fullcontrol-browser`
-skill for the full workflow.
+another tab/window instead of fighting.
+
+### Tab ownership & reaper (v1.0.5) — clean up after yourself
+
+`POST /tabs` stamps the tab with your `X-Agent-Id` (`owner`), the URL you
+asked for (`lastAgentUrl`), and a last-activity timestamp. `GET /tabs`
+returns `owner` per tab; `GET /status` lists `ownedTabs`. Records persist
+to `.tabmeta.json` (gitignored) so they survive relay restarts.
+
+**Always `DELETE /tabs/:id` in a `finally` for tabs you open.** If you
+leak one, the relay's reaper is the backstop:
+
+- A sweep (periodic; `FC_REAPER_IDLE_MS` idle threshold, default off)
+  closes a tab only when ALL hold: it has an ownership record, no agent
+  read/write for the idle window, and **no veto**:
+  - **URL diverged** from `lastAgentUrl` (a human navigated it elsewhere,
+    or a page redirect moved it) — veto-only, never a trigger.
+  - Recent human input on the tab (mousedown/keydown/wheel/touchstart
+    beacon, `isTrusted` only), or it's the active tab in a recently
+    focused window — a human is likely looking at it.
+  - Pinned, audible (playing media), or leased.
+- Tabs with NO ownership record are treated as the human's own and are
+  **never** touched by the reaper.
+- `GET /reaper` shows config + last sweep stats; `POST /reaper` triggers a
+  sweep. Config is relay env vars (`FC_REAPER_IDLE_MS`, `FC_REAPER_HUMAN_MS`,
+  `FC_REAPER_INTERVAL_MS`, `FC_REAPER_DRY_RUN`) — see the repo README.
+
+Because the reaper only needs the URL the agent last set, **reuse tabs
+where possible**: if a suitable tab already exists (`GET /tabs`), navigate
+it instead of minting a new one — fewer tabs, less reaping, and you never
+clobber the user's own tabs by mistake.
 
 ### Escape hatches
 
@@ -235,12 +267,42 @@ If that file is missing, use curl as above. Do not refuse the task.
 | screenshot empty / wrong tab | `activate` first |
 | evaluate/CSP talk | ignore — evaluate already goes through CDP |
 | debugger attach prompt | user must click Allow once on that Chrome profile |
+| `No tab with given id <N>` | the tab DIED in Chrome (Memory Saver discard, human Ctrl+W, renderer crash). RECOVER, don't abort: `GET /tabs`, re-resolve by URL, or `POST /tabs` to recreate, then continue. Re-fetch the tab list after any long gap — ids go stale. |
+| `evaluate` fails: "Cannot access a chrome-extension:// URL of different extension" | page blocks debugger attach — this is PAGE-SPECIFIC, not a broken relay. Fall back to `snapshot` + `screenshot?raw=1` (both work). See the availability table below; don't retry-loop. |
 
 Restricted pages (`chrome://`, Chrome Web Store, PDF viewer) often block content-script click/type. Use `cdp` / `evaluate` or navigate elsewhere.
+
+### Per-page evaluate/attach availability (stable, don't re-probe)
+
+`evaluate`/`cdp`/`attach` are blocked on some pages but work on others.
+Multi-session evidence:
+
+- **BLOCKED** (snapshot + screenshot only): amazon.com/.ca, gmail.com,
+  slack, discord, Google Photos picker.
+- **WORKS** (use evaluate freely): x.com, cursor.com, deepseek,
+  console.cloud.google.com, namecheap.com, linkedin.com, github.com.
+
+When a page isn't listed, one `attach` probe on a control tab decides it —
+then stop probing and use what works.
+
+### Screenshots can lie
+
+- Byte-identical md5 across calls = stale/unchanged capture; md5-compare
+  before believing a difference.
+- Screenshot right after navigate/click = mid-load spinner/blank. Wait
+  5–15s or verify state via snapshot first.
+- Screenshot captures the **visible** tab only — activate first.
 
 ## Conduct
 
 - Only the browser the user named. Do not touch other Chrome profiles or local GUI sessions.
 - Do not log or repeat the token once it works.
 - Prefer the user's existing tab when it already has the right page.
-- After finishing, leave a short report: tab id, final URL, what you did, anything blocked (login wall, captcha).
+- **Close what you open.** `DELETE /tabs/:id` in a `finally` for every tab
+  you created. Do not leave stray `about:blank` tabs behind. If you must
+  leave a tab open (e.g. a sign-in the human must finish), say so in your
+  report and note the tab id.
+- Do not navigate a tab the user is clearly using (their active tab with
+  unsaved work) unless asked.
+- After finishing, leave a short report: tab id, final URL, what you did,
+  anything blocked (login wall, captcha).

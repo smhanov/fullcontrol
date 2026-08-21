@@ -194,13 +194,17 @@ def debug_state(tab):
         "const sb=document.querySelector('[data-testid=send-button]');"
         "const st=document.querySelector('[data-testid=stop-button]');"
         "const ae=document.activeElement;"
+        "const r=sb?sb.getBoundingClientRect():null;"
+        "const at=(r&&r.width>0)?document.elementFromPoint(r.x+r.width/2,r.y+r.height/2):null;"
         "return {"
         "composerText:(ta||{}).innerText||'',"
         "activeTag:ae?ae.tagName:'none',"
         "activeCls:(ae&&ae.className&&String(ae.className).slice(0,60))||'',"
+        "hasFocus:document.hasFocus(),"
         "sendBtn:!!sb, sendDisabled:sb?sb.disabled===true:null,"
         "sendRect:(()=>{if(!sb)return null;const r=sb.getBoundingClientRect();"
         "return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),w:Math.round(r.width),h:Math.round(r.height)}})()"
+        ",atPoint:(at?at.tagName+'|'+(at.getAttribute&&at.getAttribute('data-testid')||'')+'|'+(at.className&&String(at.className).slice(0,40)||''):'null')"
         ",stopBtn:!!st,"
         "msgs:[...document.querySelectorAll('[data-message-author-role]')].map(m=>m.getAttribute('data-message-author-role'))"
         "};})())"
@@ -257,6 +261,7 @@ def send_message(sess, text, gen_timeout, debug=False):
     try:
         wait_for(lambda: submitted_state(tab), 10, "message submitted", poll=1.0)
     except TimeoutError:
+        raise_if_rate_limited(tab, "after Enter:")
         if debug:
             print(f"[gpt_fc:{AGENT_ID}] after Enter: {json.dumps(debug_state(tab))}", file=sys.stderr)
         # fallback: raise window + hit-test click on the send button
@@ -265,6 +270,7 @@ def send_message(sess, text, gen_timeout, debug=False):
         try:
             wait_for(lambda: submitted_state(tab), 10, "message submitted (click)", poll=1.0)
         except TimeoutError:
+            raise_if_rate_limited(tab, "after click:")
             if debug:
                 print(f"[gpt_fc:{AGENT_ID}] after click: {json.dumps(debug_state(tab))}", file=sys.stderr)
             raise
@@ -278,8 +284,10 @@ def completion_state(tab):
     """True completion signal: ChatGPT renders the per-message action row
     (copy-turn-action-button) inside the LAST conversation turn only when the
     reply is fully rendered. innerText length is NOT reliable under load — the
-    final DOM render lags the stream end by up to ~10s and can even blank out
-    mid-stream (observed). Returns {copy, count, lastText, errors}."""
+    final DOM render lags the stream end and can even blank out mid-stream.
+    Also reports OpenAI rate-limit dialogs ("Too many requests") which block
+    the composer with a full-screen overlay. Returns
+    {copy, count, lastText, errors, rl}."""
     expr = (
         "JSON.stringify((()=>{"
         "const turns=[...document.querySelectorAll('[data-testid^=conversation-turn-]')];"
@@ -288,36 +296,69 @@ def completion_state(tab):
         ".filter(m=>(m.innerText||'').trim().length>0);"
         "const err=[...document.querySelectorAll('[data-testid*=error]')]"
         ".map(e=>e.innerText.trim()).filter(t=>t.length>0).slice(0,3);"
+        "const rld=[...document.querySelectorAll('[role=dialog]')]"
+        ".find(x=>/Too many requests|requests too quickly/i.test(x.innerText||''));"
         "return {"
         "copy: lt? !!lt.querySelector('[data-testid=copy-turn-action-button]') : false,"
         "count: ms.length,"
         "lastText: ms.length?ms[ms.length-1].innerText:'',"
-        "errors: err"
+        "errors: err,"
+        "rl: !!rld, rlText: rld?(rld.innerText||'').slice(0,150):''"
         "};})())"
     )
     return evaluate(tab, expr)
 
 
+class RateLimited(Exception):
+    """OpenAI throttled us (Too many requests dialog). Retry with backoff."""
+
+
+def raise_if_rate_limited(tab, ctx=""):
+    st = completion_state(tab)
+    if st.get("rl"):
+        raise RateLimited(f"{ctx} rate-limited: {st.get('rlText','')[:100]}")
+
+
 def wait_final(sess, timeout, debug=False):
-    """Wait for the reply to fully render: stop button gone AND the last turn's
-    action row (copy-turn-action-button) present — the only reliable completion
-    signal (innerText stability lies under concurrent load). Confirm once more
-    after a 2s pause, then return the last assistant message."""
+    """Wait for the reply to fully render. Two conditions, both required:
+
+    1. copy-turn-action-button inside the last turn — the per-message action
+       row renders when the STREAM ends (the only reliable end-of-stream
+       signal; innerText stability alone lies mid-stream).
+    2. After that, the text must STABILIZE — the final DOM text flush can lag
+       the stream end by seconds under load (observed up to 10s+), so copy
+       appearing is not enough. Text growth resets the stable counter.
+    """
     tab = sess.tab
+    last_len, stable = -1, 0
     t0 = time.time()
     deadline = t0 + timeout
     while time.time() < deadline:
         sess.renew_if_due()
         d = completion_state(tab)
+        if d.get("rl"):
+            raise RateLimited(f"wait_final: {d.get('rlText','')[:100]}")
         if d.get("copy") and d.get("lastText"):
-            time.sleep(2)
-            d2 = completion_state(tab)
-            if d2.get("copy") and d2.get("lastText") and len(d2.get("lastText")) == len(d.get("lastText")):
-                if debug:
-                    print(f"[gpt_fc:{AGENT_ID}] final {len(d2['lastText'])} chars at +{time.time()-t0:.1f}s", file=sys.stderr)
-                return {"count": d2["count"], "last": d2["lastText"], "errors": d2.get("errors") or []}
+            ln = len(d.get("lastText"))
+            if ln == last_len:
+                stable += 1
+                if stable >= 5:  # ~10s stable after stream end — the final
+                    # text chunk can arrive up to ~10s late under load
+                    time.sleep(2)
+                    d2 = completion_state(tab)
+                    if d2.get("copy") and len(d2.get("lastText") or "") == ln:
+                        if debug:
+                            print(f"[gpt_fc:{AGENT_ID}] final {ln} chars at +{time.time()-t0:.1f}s", file=sys.stderr)
+                        return {"count": d2["count"], "last": d2["lastText"], "errors": d2.get("errors") or []}
+                    last_len = len(d2.get("lastText") or "")
+                    stable = 0
+            else:
+                last_len = ln
+                stable = 0
+        else:
+            last_len, stable = -1, 0
         if debug:
-            print(f"[gpt_fc:{AGENT_ID}] poll +{time.time()-t0:.1f}s copy={d.get('copy')} len={len(d.get('lastText') or '')}", file=sys.stderr)
+            print(f"[gpt_fc:{AGENT_ID}] poll +{time.time()-t0:.1f}s copy={d.get('copy')} len={len(d.get('lastText') or '')} stable={stable}", file=sys.stderr)
         time.sleep(2.0)
     return read_last_assistant(tab)
 
@@ -336,6 +377,8 @@ def main():
     ap.add_argument("--agent-id", default=AGENT_ID, help="X-Agent-Id (default: env or 'default')")
     ap.add_argument("--debug", action="store_true", help="dump state on submit failure")
     ap.add_argument("--no-close", action="store_true", help="leave tab+window open for inspection")
+    ap.add_argument("--retries", type=int, default=2,
+                    help="rate-limit retries with backoff (default 2 → 3 attempts, 30/60s)")
     args = ap.parse_args()
     AGENT_ID = args.agent_id
     if args.file:
@@ -350,43 +393,56 @@ def main():
 
     sess = None
     t0 = time.time()
-    try:
-        sess = GptSession(args.model, use_window=not args.no_window)
-        wait_for(lambda: composer_state(sess.tab).get("hasComposer"), 60, "temp chat composer")
+    retries = max(0, args.retries)
+    backoffs = [30, 60, 120, 240]
+    for attempt in range(retries + 1):
+        try:
+            sess = GptSession(args.model, use_window=not args.no_window)
+            wait_for(lambda: composer_state(sess.tab).get("hasComposer"), 60, "temp chat composer")
+            raise_if_rate_limited(sess.tab, "pre-submit:")  # fresh chat may open into the modal
 
-        if len(prompt) <= CHUNK:
-            send_message(sess, prompt, args.gen_timeout, debug=args.debug)
-        else:
-            parts = [prompt[i:i + CHUNK] for i in range(0, len(prompt), CHUNK)]
-            n = len(parts)
-            for i, part in enumerate(parts, 1):
-                send_message(sess, f"[CONVERSATION PART {i}/{n}]\n{part}", args.gen_timeout, debug=args.debug)
+            if len(prompt) <= CHUNK:
+                send_message(sess, prompt, args.gen_timeout, debug=args.debug)
+            else:
+                parts = [prompt[i:i + CHUNK] for i in range(0, len(prompt), CHUNK)]
+                n = len(parts)
+                for i, part in enumerate(parts, 1):
+                    send_message(sess, f"[CONVERSATION PART {i}/{n}]\n{part}", args.gen_timeout, debug=args.debug)
 
-        rd = wait_final(sess, args.timeout, debug=args.debug)
-        text = (rd.get("last") or "").strip()
-        errors = rd.get("errors") or []
-        if errors:
-            print(json.dumps({"ok": False, "error": "chat error: " + errors[0][:300],
-                              "chars": len(text), "text": text[:2000],
+            rd = wait_final(sess, args.timeout, debug=args.debug)
+            text = (rd.get("last") or "").strip()
+            errors = rd.get("errors") or []
+            if errors:
+                print(json.dumps({"ok": False, "error": "chat error: " + errors[0][:300],
+                                  "chars": len(text), "text": text[:2000],
+                                  "elapsed": round(time.time() - t0, 1)}))
+                sys.exit(1)
+            if not text:
+                print(json.dumps({"ok": False, "error": "empty assistant reply",
+                                  "elapsed": round(time.time() - t0, 1)}))
+                sys.exit(1)
+            print(json.dumps({"ok": True, "text": text, "chars": len(text),
+                              "model": args.model or "default",
                               "elapsed": round(time.time() - t0, 1)}))
-            sys.exit(1)
-        if not text:
-            print(json.dumps({"ok": False, "error": "empty assistant reply",
+            return
+        except RateLimited as e:
+            if attempt >= retries:
+                print(json.dumps({"ok": False, "error": f"rate limited after {retries+1} attempts: {e}",
+                                  "elapsed": round(time.time() - t0, 1)}))
+                sys.exit(4)
+            wait_s = backoffs[attempt] if attempt < len(backoffs) else 240
+            print(f"[gpt_fc:{AGENT_ID}] {e} — retry {attempt+2}/{retries+1} in {wait_s}s", file=sys.stderr)
+            time.sleep(wait_s)
+        except TimeoutError as e:
+            print(json.dumps({"ok": False, "error": str(e), "elapsed": round(time.time() - t0, 1)}))
+            sys.exit(2)
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}",
                               "elapsed": round(time.time() - t0, 1)}))
-            sys.exit(1)
-        print(json.dumps({"ok": True, "text": text, "chars": len(text),
-                          "model": args.model or "default",
-                          "elapsed": round(time.time() - t0, 1)}))
-    except TimeoutError as e:
-        print(json.dumps({"ok": False, "error": str(e), "elapsed": round(time.time() - t0, 1)}))
-        sys.exit(2)
-    except Exception as e:
-        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}",
-                          "elapsed": round(time.time() - t0, 1)}))
-        sys.exit(3)
-    finally:
-        if sess and not args.no_close:
-            sess.close()
+            sys.exit(3)
+        finally:
+            if sess and not args.no_close:
+                sess.close()
 
 
 if __name__ == "__main__":

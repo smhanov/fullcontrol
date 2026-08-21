@@ -1,0 +1,23 @@
+{
+  "320210730": {
+    "owner": "default",
+    "createdAt": 1787322986798,
+    "lastAgentAt": 1787322991839,
+    "lastAgentUrl": "http://127.0.0.1:18998/trusted.html",
+    "humanAt": 1787322987626
+  },
+  "320210735": {
+    "owner": "agent-a",
+    "createdAt": 1787322991912,
+    "lastAgentAt": 1787322992952,
+    "lastAgentUrl": "http://127.0.0.1:18998/trusted.html",
+    "humanAt": 0
+  },
+  "320210736": {
+    "owner": "agent-b",
+    "createdAt": 1787322992441,
+    "lastAgentAt": 1787322992952,
+    "lastAgentUrl": "http://127.0.0.1:18998/trusted.html",
+    "humanAt": 0
+  }
+}

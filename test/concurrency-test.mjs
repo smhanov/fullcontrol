@@ -99,7 +99,15 @@ async function swEvaluate(expression) {
 function startRelay() {
   serverProc = spawn("node", ["server/index.js"], {
     cwd: ROOT,
-    env: { ...process.env, FULLCONTROL_PORT: String(RELAY_PORT), FULLCONTROL_HOST: "127.0.0.1", FULLCONTROL_TOKEN_FILE: TOKEN_FILE },
+    env: {
+      ...process.env,
+      FULLCONTROL_PORT: String(RELAY_PORT),
+      FULLCONTROL_HOST: "127.0.0.1",
+      FULLCONTROL_TOKEN_FILE: TOKEN_FILE,
+      // Isolated tab-ownership store — never touch the production relay's
+      // .tabmeta.json (the test Chrome's tabs are not real).
+      FC_TABMETA_FILE: path.join(ROOT, "test", `.tabmeta-${RELAY_PORT}.json`),
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   serverProc.stdout.on("data", (d) => process.env.FC_TEST_VERBOSE && process.stdout.write(`[relay] ${d}`));

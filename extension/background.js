@@ -422,6 +422,7 @@ async function click(params) {
   const tabId = num(params.tabId);
   const button = params.button || "left";
   const clickCount = params.clickCount || 1;
+  if (params.focus) await ensureFocused(tabId);
   if (params.x != null && params.y != null) {
     await attach(tabId);
     await trustedClick(tabId, params.x, params.y, button, clickCount);
@@ -518,6 +519,7 @@ async function typeText(params) {
     });
   }
   if (params.slowly) {
+    if (params.focus) await ensureFocused(tabId);
     await attach(tabId);
     for (const ch of params.text || "") {
       await sendCdp(tabId, "Input.dispatchKeyEvent", {
@@ -544,6 +546,7 @@ async function pressKey(params) {
   const tabId = num(params.tabId);
   const key = params.key;
   try {
+    if (params.focus) await ensureFocused(tabId);
     await attach(tabId);
     const def = keyDef(key);
     await sendCdp(tabId, "Input.dispatchKeyEvent", {
@@ -647,6 +650,17 @@ async function getCookies(params) {
   if (params.url) return chrome.cookies.getAll({ url: params.url });
   if (params.domain) return chrome.cookies.getAll({ domain: params.domain });
   return chrome.cookies.getAll({});
+}
+
+async function ensureFocused(tabId) {
+  // CDP Input events (keys, mouse) only reach the ACTIVE tab of the FOCUSED
+  // window — background windows silently drop them. Agents driving a tab in
+  // an unfocused window (e.g. per-agent windows minted unfocused for
+  // concurrency) must raise the window before dispatching input. Callers opt
+  // in via {focus:true} so e14's real-browser flow never steals Steve's focus.
+  const tab = await chrome.tabs.get(tabId);
+  await chrome.windows.update(tab.windowId, { focused: true });
+  await chrome.tabs.update(tabId, { active: true });
 }
 
 async function attach(tabId) {

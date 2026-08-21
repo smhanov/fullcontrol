@@ -246,6 +246,12 @@ def submitted_state(tab):
     return (not s.get("composerText")) or s.get("stopBtn")
 
 
+def _norm(s):
+    """Collapse whitespace so ProseMirror's extra blank lines around lists
+    don't fail the insertText verification."""
+    return " ".join((s or "").split())
+
+
 def send_message(sess, text, gen_timeout, debug=False):
     """Insert text, submit with trusted Enter (verified), fall back to clicking
     the send button if Enter doesn't clear the composer. Wait for re-arm."""
@@ -254,7 +260,7 @@ def send_message(sess, text, gen_timeout, debug=False):
     ins = insert_text(tab, text)
     if ins.get("err"):
         raise RuntimeError(f"insertText failed: {ins['err']}")
-    if ins.get("content", "").strip() != text.strip():
+    if _norm(ins.get("content", "")) != _norm(text):
         raise RuntimeError(f"insertText mismatch: got {ins.get('content')!r}")
     # primary: trusted Enter (immune to button hit-test races under load)
     press_enter(tab)

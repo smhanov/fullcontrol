@@ -18,12 +18,15 @@ USER RULE (Noah, explicit): every task gets its OWN fresh TEMPORARY chat.
 Never type into existing conversations. Temp chats are closed after use.
 
 Usage:
-  python3 scripts/gpt_fc.py "your prompt" [--model gpt-5-6] [--timeout 600]
+  python3 scripts/gpt_fc.py "your prompt" [--model gpt-5-6] [--timeout 900]
   python3 scripts/gpt_fc.py --file /path/to/prompt.txt [--agent-id worker-3]
   echo "prompt" | python3 scripts/gpt_fc.py --stdin
 
 Output: JSON on stdout: {"ok":true,"text":"...","chars":N,"model":"...","elapsed":S}
         {"ok":false,"error":"..."} on failure (tab+window still cleaned up).
+On a generation timeout the driver re-attaches to the still-open tab and
+waits for the reply to finish (--timeout-retries/--grace) instead of
+discarding the in-progress reply — ChatGPT keeps generating in the background.
 """
 import argparse, json, os, signal, sys, time, urllib.request, urllib.error
 
@@ -366,7 +369,43 @@ def wait_final(sess, timeout, debug=False):
         if debug:
             print(f"[gpt_fc:{AGENT_ID}] poll +{time.time()-t0:.1f}s copy={d.get('copy')} len={len(d.get('lastText') or '')} stable={stable}", file=sys.stderr)
         time.sleep(2.0)
-    return read_last_assistant(tab)
+    # Deadline hit. Distinguish "finished right after the last poll" (copy
+    # button present = complete, safe to return) from "genuinely still
+    # generating" (copy absent = truncated). The latter must NOT be reported
+    # as ok:true — that's how truncated replies silently slipped through as
+    # "success" before.
+    d = completion_state(tab)
+    if d.get("copy") and d.get("lastText"):
+        return {"count": d["count"], "last": d["lastText"], "errors": d.get("errors") or []}
+    raise TimeoutError(
+        f"reply incomplete after {timeout}s "
+        f"(copy-button never appeared; {len(d.get('lastText') or '')} chars so far)"
+    )
+
+
+def recover_timeout(sess, grace, debug=False):
+    """After a TimeoutError the tab usually still holds the reply — ChatGPT
+    keeps generating in the background, so our deadline expiring does NOT stop
+    the model. Re-attach and poll for the copy-button up to `grace` seconds;
+    return the finished text or None. This turns wasted runs into recovered
+    results instead of closing a tab mid-generation (which also throws away
+    the plan-billed tokens already spent)."""
+    tab = sess.tab
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        sess.renew_if_due()
+        try:
+            d = completion_state(tab)
+        except Exception:
+            return None
+        if d.get("rl"):
+            return None  # genuinely throttled; caller should retry, not read
+        if d.get("copy") and d.get("lastText"):
+            return d["lastText"].strip() or None
+        if debug:
+            print(f"[gpt_fc:{AGENT_ID}] recover poll +{time.time()-deadline+grace:.1f}s copy={d.get('copy')} len={len(d.get('lastText') or '')}", file=sys.stderr)
+        time.sleep(5)
+    return None
 
 
 def main():
@@ -376,8 +415,8 @@ def main():
     ap.add_argument("--file", help="read prompt from file")
     ap.add_argument("--stdin", action="store_true", help="read prompt from stdin")
     ap.add_argument("--model", default=None, help="model slug (best-effort; app may use default)")
-    ap.add_argument("--timeout", type=int, default=600, help="max seconds for final reply")
-    ap.add_argument("--gen-timeout", type=int, default=180, help="max seconds per chunk generation")
+    ap.add_argument("--timeout", type=int, default=900, help="max seconds for final reply")
+    ap.add_argument("--gen-timeout", type=int, default=600, help="max seconds per chunk generation (gpt-5-6-thinking can take 5-15 min on big planning tasks)")
     ap.add_argument("--no-window", action="store_true",
                     help="skip per-agent window; lease a shared-window tab instead")
     ap.add_argument("--agent-id", default=AGENT_ID, help="X-Agent-Id (default: env or 'default')")
@@ -385,6 +424,10 @@ def main():
     ap.add_argument("--no-close", action="store_true", help="leave tab+window open for inspection")
     ap.add_argument("--retries", type=int, default=2,
                     help="rate-limit retries with backoff (default 2 → 3 attempts, 30/60s)")
+    ap.add_argument("--timeout-retries", type=int, default=1,
+                    help="on a generation timeout, re-attach to the still-open tab and wait for the reply to finish (default 1)")
+    ap.add_argument("--grace", type=int, default=300,
+                    help="max extra seconds to wait for a timed-out reply to finish (used by --timeout-retries)")
     args = ap.parse_args()
     AGENT_ID = args.agent_id
     if args.file:
@@ -440,6 +483,19 @@ def main():
             print(f"[gpt_fc:{AGENT_ID}] {e} — retry {attempt+2}/{retries+1} in {wait_s}s", file=sys.stderr)
             time.sleep(wait_s)
         except TimeoutError as e:
+            # The tab usually still holds the reply — ChatGPT keeps generating
+            # after our deadline. Re-attach and wait for it to finish instead
+            # of burning the (already plan-billed) generation. This is the
+            # automated version of the "re-attach and read the last assistant
+            # node" recovery trick.
+            if sess and args.timeout_retries > 0:
+                rec = recover_timeout(sess, args.grace, debug=args.debug)
+                if rec:
+                    print(json.dumps({"ok": True, "recovered_after_timeout": True,
+                                      "text": rec, "chars": len(rec),
+                                      "model": args.model or "default",
+                                      "elapsed": round(time.time() - t0, 1)}))
+                    return
             print(json.dumps({"ok": False, "error": str(e), "elapsed": round(time.time() - t0, 1)}))
             sys.exit(2)
         except Exception as e:

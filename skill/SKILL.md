@@ -25,7 +25,7 @@ Optional token (any one):
 
 1. User pasted a token
 2. `$FULLCONTROL_TOKEN`
-3. First line of `/home/smhanov/fullcontrol/.token` (local relay only)
+3. First line of the relay's `.token` file (repo dir — `FULLCONTROL_TOKEN_FILE` overrides)
 4. Ask the user — do not guess
 
 ```bash
@@ -100,6 +100,9 @@ curl -sS "${AUTH[@]}" "$HOST/tabs/123/screenshot?raw=1" -o /tmp/fc-shot.png
 curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/evaluate" \
   -d '{"expression":"document.title"}'
 # → { "result": "…", "via": "cdp" }
+# NOTE: `result` is a JSON string ONLY when the page returns a string;
+# numbers/booleans/objects come back as native JSON. A helper that blindly
+# `json.loads(result)` throws — only parse when isinstance(v, str).
 
 curl -sS "${AUTH[@]}" "$HOST/tabs/123/console"
 ```
@@ -172,6 +175,34 @@ curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/wait" \
   -d '{"text":"Signed in","timeout":15000}'
 ```
 
+### Pick the act path by framework (do this before burning turns)
+
+Synthetic `el.dispatchEvent` events and raw value-set are untrusted —
+modern frameworks silently ignore them. Choose the act primitive by what the
+page uses:
+
+| Page uses | Use | Don't use |
+| --- | --- | --- |
+| React / Vue / any `isTrusted` check | `/click {ref}` (trusted CDP) | `evaluate el.click()` / `dispatchEvent` |
+| AngularJS + select2 (Namecheap DNS) | `/select {ref, value}` — the ONLY reliable dropdown path | raw value-set + change, synthetic clicks |
+| Native `<select>` that HANGS `/select` | trusted `/click` the combobox → options render as `listbox`/`option` refs → click the option | retrying `/select` with a bigger timeout — it just times out again |
+| Angular Material (CDK) overlays / mat-select | `/click {ref}` to OPEN panels; then snapshot | `/press Escape` to close (never works — panels accumulate; attribute options by `id="<FieldId>-panel"` boundaries) |
+| Plain HTML buttons/links | `/click {ref}` or `/click {x,y}` | — |
+| Search boxes that server-filter (LinkedIn DM, mat-select search) | treat as TRAP: typing hides the list / never filters. Reset via navigation, or read the page's API | fighting the input |
+
+Notes:
+
+- All act endpoints live on `POST /tabs/:id/<action>`: `select activate
+  reload wait hover scroll back forward console cookies`.
+- Typing into React-controlled inputs: raw `el.value = ...` does NOT fire
+  React's change handlers. When `/type`'s trusted input is not an option,
+  use `el.focus()` + `document.execCommand('selectAll', false)` +
+  `document.execCommand('insertText', false, text)` so the framework's
+  handlers fire.
+- `form.submit()` bypasses the SPA's own submit handler — fields silently
+  drop from the request. Prefer a trusted `/click` on the real submit
+  control, then verify which fields applied.
+
 ### Multi-agent concurrency (v1.0.2+)
 
 Multiple agents can share one browser. Identify yourself on every request
@@ -231,7 +262,10 @@ clobber the user's own tabs by mistake.
 curl -sS "${AUTH[@]}" -X POST "$HOST/tabs/123/cdp" \
   -d '{"method":"Runtime.evaluate","params":{"expression":"1+2","returnByValue":true}}'
 
-# Any extension method
+# Any extension method. NOTE: /rpc is a TOP-LEVEL endpoint (never
+# /tabs/:id/rpc) and only knows BACKGROUND methods (ping, listTabs,
+# closeWindow). Content-script-only commands (e.g. query) return
+# "unknown method".
 curl -sS "${AUTH[@]}" -X POST "$HOST/rpc" \
   -d '{"method":"ping","params":{}}'
 ```
@@ -244,13 +278,101 @@ WebSocket (optional, for live tab/console events):
 
 Send `{"id":1,"method":"listTabs","params":{}}`. Replies are `{"type":"response","id":1,"result":…}`.
 
+## File uploads (native pickers) — drive via CDP, never the OS dialog
+
+Any flow that opens an `<input type=file>` (avatar uploads, attachment
+pickers) pops a NATIVE OS dialog automation cannot touch. Feed the hidden
+input over CDP instead:
+
+1. Click the button that triggers the picker (the hidden input appears in
+   the DOM).
+2. `POST /tabs/:id/cdp`: `DOM.getDocument` (root `nodeId`) →
+   `DOM.querySelector` `{nodeId, selector:"#avatar_upload"}` →
+   `DOM.setFileInputFiles` `{nodeId, files:["/abs/path.jpg"]}`. The file
+   must exist on the browser host.
+3. **The triggering click re-renders the DOM — always re-query the nodeId
+   AFTER the click.** A nodeId captured before goes stale and the set
+   silently no-ops.
+4. The page shows its own crop/preview modal — finish with normal
+   snapshot/click. Verify via the resulting asset URL, not bytes (servers
+   re-encode/crop).
+
+## Common flow gotchas
+
+### Google OAuth sign-in opens a NEW TAB — not a popup
+
+Clicking "Sign in with Google" mints a new tab at `accounts.google.com/...`
+(chooser → consent → redirect); the original site tab sits idle. If the
+snapshot doesn't change after the click, do NOT retry-click — `GET /tabs`
+and look for the new `accounts.google.com` tab, drive it, and poll the
+original tab for the signed-in app shell. Same-tab variant exists on
+SvelteKit sites (chooser/consent/redirect in the SAME tab) — check the
+current tab's URL first.
+
+### hCaptcha / anti-bot signup flows
+
+Real Chrome passes the hCaptcha checkbox; headless and stealth browsers do
+not. The checkbox sits ~25px inside the widget's top-left corner, so
+trusted-click `{x: bbox.x + 25, y: bbox.y + 25}` on the widget iframe node —
+the CDP click lands INSIDE the cross-origin iframe and opens the challenge
+(a second iframe). **Do NOT auto-solve the puzzle with vision** — a wrong
+click silently resets the challenge; route to the human watching the
+visible browser instead. Verify a token exists before submitting:
+`/evaluate` `(document.querySelector('[name=h-captcha-response]')||{}).value`
+non-empty.
+
+### Cloudflare-walled download pages (direct-link capture)
+
+For sites that 403 curl (Cloudflare + Turnstile) but work in a real browser,
+where the download button mints a one-time direct link: the real browser
+auto-passes "Just a moment" in ~5–10s and invisible Turnstile auto-solves;
+the success handler then renders the generated link into the DOM (e.g.
+`#downloaddirect_info a`). Read that href via `/evaluate` — `window.open()`
+popups get eaten by the blocker. Then curl the direct CDN link from your
+machine with `-C -` resume, a browser UA, and `--retry 5`.
+
+## Heavy SPAs & long-running work
+
+- **Background tabs never hydrate React SPAs.** A tab opened with
+  `active:false` gets the HTML shell but the app never mounts while hidden
+  (`evaluate` returns empty `innerText` forever, no error). `activate` the
+  tab and it renders within seconds. Corollary: bulk crawls CANNOT fan out
+  across background tabs — use one dedicated ACTIVE tab and iterate
+  navigate → wait → extract. If a crawl starts failing wholesale with "no
+  content rendered", suspect the tab went inactive before blaming selectors.
+- **SPA e-commerce playbook** (logged-in storefronts): poll through auth
+  redirects (SPAs async-redirect; handle BOTH signed-in and signed-out
+  states); toast overlays intercept hit-tested clicks — dismiss before the
+  next action; duplicate button names in confirm dialogs — pick the one
+  whose bbox is INSIDE the dialog; cards render async — walk to the next
+  title boundary and verify the confirmation toast appeared before moving
+  on; read prices/totals from a FULL snapshot (`interestingOnly:false`);
+  empty states render different headings (wait on the union of possible
+  states); cross-origin checkout iframes render async — screenshots are the
+  read path for their contents; card entry + pay stays human-in-the-loop.
+- **Enumeration gaps.** Buttons can be styled `<span>`/`<div>` with no
+  `role=button` — sweep ALL element types by innerText
+  (`a,div,span,p,li,input,button`, visible rect + short text) when a
+  role-based sweep finds nothing. Design-system web components (`<gcds-*>`
+  etc.) hide links from `a[href]` sweeps — sweep custom-element tags and
+  read their attributes, or dump `documentElement.innerHTML` and regex it.
+- **Long-run discipline.** (a) After 2 consecutive failures on a bulk op,
+  stop patching the script — switch primitives (different browser,
+  snapshot+click, or the human). (b) Never trust the script's own "OK" log
+  — verify against LIVE state (page counter, API, fresh snapshot) after
+  each batch. (c) On a blocker that forces repeated diagnostics, check in
+  with the user: what's captured, the holdup, 2–3 options. (d) Admin
+  panels drop sessions fast — expect re-login/2FA; probe which accounts are
+  actually logged in before promising a flow.
+
 ## Helper (if the repo is local)
 
 ```bash
-node /home/smhanov/fullcontrol/scripts/fc.mjs --host HOST[:PORT] --token TOKEN tabs
-node /home/smhanov/fullcontrol/scripts/fc.mjs --host HOST open https://example.com
-node /home/smhanov/fullcontrol/scripts/fc.mjs --host HOST snapshot TAB
-node /home/smhanov/fullcontrol/scripts/fc.mjs --host HOST shot TAB -o /tmp/page.png
+node <repo>/scripts/fc.mjs --host HOST[:PORT] --token TOKEN tabs
+node <repo>/scripts/fc.mjs --host HOST open https://example.com
+node <repo>/scripts/fc.mjs --host HOST snapshot TAB
+node <repo>/scripts/fc.mjs --host HOST shot TAB -o /tmp/page.png
+# `<repo>` = the checkout directory, e.g. `~/fullcontrol`.
 ```
 
 If that file is missing, use curl as above. Do not refuse the task.
@@ -278,9 +400,13 @@ Restricted pages (`chrome://`, Chrome Web Store, PDF viewer) often block content
 Multi-session evidence:
 
 - **BLOCKED** (snapshot + screenshot only): amazon.com/.ca, gmail.com,
-  slack, discord, Google Photos picker.
+  discord, Google Photos picker. Some pages (e.g. wygo.world ticket
+  checkout) block evaluate/cdp but still accept snapshot/click/type/select.
 - **WORKS** (use evaluate freely): x.com, cursor.com, deepseek,
-  console.cloud.google.com, namecheap.com, linkedin.com, github.com.
+  console.cloud.google.com, ap.www.namecheap.com, propertyline (MPAC),
+  app.slack.com (Slack web client), atlassian.net / id.atlassian.com (Jira
+  Cloud), linkedin.com, github.com, notebook.google.com /
+  notebooklm.google.com (NotebookLM — CDP `DOM.setFileInputFiles` works too).
 
 When a page isn't listed, one `attach` probe on a control tab decides it —
 then stop probing and use what works.
@@ -292,6 +418,12 @@ then stop probing and use what works.
 - Screenshot right after navigate/click = mid-load spinner/blank. Wait
   5–15s or verify state via snapshot first.
 - Screenshot captures the **visible** tab only — activate first.
+- Default response is a JSON envelope `{"mimeType":"image/png","data":"<base64>"}`,
+  not raw bytes — pass `?raw=1` (or decode `data`) or the file is text and
+  image tools reject it.
+- Vision models misread small numeric text. When a verification hinges on a
+  number, cross-check with `/evaluate` on `document.body.innerText` — the
+  DOM is ground truth, the screenshot is not.
 
 ## Conduct
 
@@ -306,3 +438,7 @@ then stop probing and use what works.
   unsaved work) unless asked.
 - After finishing, leave a short report: tab id, final URL, what you did,
   anything blocked (login wall, captcha).
+- Check in with the user on long harvest loops when a blocker forces
+  repeated diagnostics — status beats a silent wall of retries.
+- Verify against live state (page counter / API / fresh snapshot), never
+  your own script's "OK" log — a script reporting success is a hypothesis.

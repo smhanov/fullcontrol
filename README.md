@@ -130,6 +130,27 @@ Identify yourself on every request with `X-Agent-Id: <name>` (default
   `GET /tabs?windowId=W`. Writes to tabs in the same window serialize via a
   per-window mutex, so parallel agents don't race the visible tab.
 
+## Capturing auth-gated downloads (raw CDP)
+
+The relay is the normal path, but when a site serves downloads from signed
+URLs curl can't reach, drive Chrome's raw CDP endpoint directly
+(`--remote-debugging-port`):
+
+- Resolve browser + page targets dynamically at runtime (`/json/version` →
+  `webSocketDebuggerUrl`, `/json/list` → page targets — IDs rotate on every
+  Chrome restart; never hardcode them).
+- Send `Browser.setDownloadBehavior {behavior:"allow", downloadPath,
+  eventsEnabled:true}` on the **browser** target — sent on a page target it
+  silently drops files into `~/Downloads`.
+- Listen for `Browser.downloadWillBegin` + `Browser.downloadProgress` on the
+  browser target's socket.
+- `Input.dispatchMouseEvent` no-ops on background windows — call
+  `Page.bringToFront` first.
+- Trigger: `Page.navigate` a spare tab to the signed URL; the download
+  manager resolves redirects and fires `downloadProgress completed`.
+
+See `scripts/` for helpers and `test/` for an isolated harness pattern.
+
 ## Tab reaper (v1.0.5)
 
 Agents leak tabs — every `POST /tabs` mints one and "close in a finally"
@@ -171,14 +192,36 @@ Agents should still close what they open (`DELETE /tabs/:id` in a
 | `FC_REAPER_INTERVAL_MS` | `600000` | Sweep period |
 | `FC_REAPER_DRY_RUN` | `1` | `0` = actually close tabs |
 
+`FULLCONTROL_TOKEN` wins over the `.token` file when both exist — if the env
+var is set on a relay, a stale `.token` file copied from an earlier run will
+401. Fetch the real token per run rather than caching one.
+
+## Operational gotchas
+
+- **Port shadowing:** if you SSH-tunnel a remote relay
+  (`ssh -L 18765:127.0.0.1:18765 <relay-host>`) while a local relay also
+  runs, the local one owns the port and you silently drive the WRONG browser
+  (same API, different machine). Sanity-check `GET /health` + `GET /tabs`
+  against expectations, or tunnel to a different local port.
+- **Tab discards:** Chrome's Memory Saver can silently discard idle tabs —
+  "No tab with given id" after a long gap. Launch with
+  `--disable-features=MemorySaver,DiscardHeuristics` where you control the
+  browser, and re-fetch `GET /tabs` after any long idle.
+- **Screenshot bytes:** the default screenshot response is a JSON envelope
+  (base64 `data`), not raw bytes — pass `?raw=1` for PNG bytes.
+
 ## Give this to an agent
 
-Copy `skill/SKILL.md` into the agent's skills directory (Claude: `~/.claude/skills/fullcontrol-browser/SKILL.md`). Then tell the agent the hostname:
+Copy `skill/SKILL.md` into the agent's skills directory (Claude: `~/.claude/skills/fullcontrol-browser/SKILL.md`, Hermes: `~/.hermes/skills/devops/fullcontrol-browser/SKILL.md`). Then tell the agent the hostname:
 
 > use fullcontrol on alice-laptop  
 > control http://10.0.0.4:18765 and book the Tuesday slot
 
 The skill tells the agent to probe `/health`, snapshot before acting, and never click blind.
+
+`skill/SKILL.md` is intentionally **generic** — no usernames, host IPs, or
+login state. Keep it that way; deployment specifics belong in the operator's
+private copy of the skill, not in this public repo.
 
 ## Tests
 

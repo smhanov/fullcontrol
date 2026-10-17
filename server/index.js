@@ -644,6 +644,12 @@ async function handleApi(req, res, url) {
     if (method !== "POST" && method !== "GET") throw new Error("method not allowed");
     const body = method === "GET" ? Object.fromEntries(url.searchParams) : await readBody(req);
     const params = { tabId, ...body };
+    // GET query params arrive as strings; coerce pure-numeric values to
+    // integers so Chrome APIs that demand numeric types accept them
+    // (e.g. captureVisibleTab quality: "70" -> 70).
+    for (const k of Object.keys(params)) {
+      if (typeof params[k] === "string" && /^-?\d+$/.test(params[k])) params[k] = parseInt(params[k], 10);
+    }
 
     // Lease enforcement: write actions 409 when another agent holds the tab.
     if (WRITE_ACTIONS.has(action)) {

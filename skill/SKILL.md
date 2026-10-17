@@ -381,9 +381,10 @@ If that file is missing, use curl as above. Do not refuse the task.
 
 | Symptom | Fix |
 | --- | --- |
-| connection refused | wrong host/port; relay not running (`node server/index.js`) |
+| connection refused | wrong host/port; relay not running (`node server/index.js`). If you are ON the relay host itself, probe `GET /health` first - an agent "can not reach the relay" is often the relay answering fine while the extension is not connected (next row) |
 | 401 | bad/missing token |
 | 503 `extension not connected` | Chrome/extension not talking to relay |
+| `extensionConnected:false` for minutes while the browser still runs | the extension offscreen document (the relay-WebSocket holder) died and the service-worker keepalive did not recreate it - it will NOT come back on its own; do not poll /status in a loop. Restart the browser process (the session/tabs restore); the extension reconnects within seconds. On a desktop browser without a debug port, ask the user to restart it |
 | `stale ref` | snapshot again, use the new `ref` |
 | `not found: #foo` | snapshot; element may be in iframe, shadow DOM, or not exist |
 | screenshot empty / wrong tab | `activate` first |
